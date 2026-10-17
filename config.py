@@ -22,4 +22,6 @@ MIN_STATS_SAMPLE=number('MIN_STATS_SAMPLE',50,30,100000,True)
 PAPER_MAX_GAP=number('PAPER_MAX_GAP',2,0.1,10)
 SIGNAL_COOLDOWN=number('SIGNAL_COOLDOWN',5,1,60)
 # No artificial wait is used; kept in .env for migration clarity only.
+ANALYSIS_MIN = number('ANALYSIS_MIN', 1.0, 0.0, 10.0)
+ANALYSIS_MAX = number('ANALYSIS_MAX', 3.0, 0.5, 10.0)
 DATA_DIR=ROOT/'data'

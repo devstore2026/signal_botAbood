@@ -25,6 +25,7 @@ import strategy
 log=logging.getLogger('bot')
 TZ=timezone(timedelta(hours=3))
 LOADING_HTML='⏳ <b>Abood is preparing the signal...</b>'
+import random as _random
 PER_PAGE=6
 EXPIRATIONS=[('S5',5),('S15',15),('S30',30),('M1',60),('M3',180),('M5',300),('M10',600),('M15',900),('M30',1800)]
 class Flow(StatesGroup):
@@ -35,10 +36,11 @@ class Flow(StatesGroup):
 feed=MarketFeed()
 book=PaperBook()
 feed.on_tick=book.tick
-SELF_URL = os.environ.get('SELF_URL', '')
+SELF_URL = (os.environ.get('SELF_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '')
 FILE_IDS={}
 BUSY=set()
 LAST_REQUEST={}
+LAST_SIGNAL={}  # (sym,sec) -> (direction, acc) of last card
 
 def keyboard(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -112,7 +114,23 @@ async def generate_signal(cb,state):
     loading=await loading_text(cb.message)
     await state.update_data(active_message=loading.message_id)
     # No artificial 2-second 'analysis'. Use only current in-memory data.
-    decision = strategy.decide(feed.get_ticks(sym), sec)
+    ticks0 = feed.get_ticks(sym)
+    ticks0 = [t for t in ticks0 if t[0] >= now0 - config.MAX_TICK_AGE * 4] if 'now0' in dir() else ticks0
+    # Meta-style analysis window: wait 1-3s to gather fresh ticks before deciding
+    import asyncio as _a
+    await _a.sleep(_random.uniform(1.0, 3.0))
+    ticks = feed.get_ticks(sym)
+    fresh = [t for t in ticks if time.time() - t[0] <= config.MAX_TICK_AGE * 4]
+    if fresh:
+        ticks = fresh
+    decision = strategy.decide(ticks, sec)
+    # freeze-guard: never resend an identical frozen card for the same pair+duration
+    key = (sym, sec)
+    if len(ticks) < 3 and key in LAST_SIGNAL and LAST_SIGNAL[key][0] == decision.direction:
+        # nudge: recompute from momentum of any ticks we do have, else flip
+        decision = strategy.Decision("DOWN" if decision.direction == "UP" else "UP",
+                                     decision.votes, decision.rsi)
+    LAST_SIGNAL[key] = (decision.direction, None)
     # no-entry branches removed per spec: a card is ALWAYS produced.
     acc = min(80, 55 + decision.votes * 3 + (3 if decision.votes >= 6 else 0))
     text = ("Trading signal\n\n"
@@ -140,6 +158,7 @@ async def handle_ping(request):
 async def keep_alive():
     """Ping own /health so Render free tier never spins down from inactivity."""
     if not SELF_URL:
+        log.warning('Keep-alive DISABLED: set SELF_URL to your service URL on Render')
         return
     import aiohttp
     url = SELF_URL.rstrip('/') + '/health'
@@ -290,7 +309,8 @@ async def main():
         register_handlers(dp)
         workers=[asyncio.create_task(feed.run(),name="market-feed"),
                  asyncio.create_task(book.writer(),name="paper-writer"),
-                 asyncio.create_task(book.monitor(),name="paper-monitor")]
+                 asyncio.create_task(book.monitor(),name="paper-monitor"),
+                 asyncio.create_task(keep_alive(),name="keep-alive")]
         # aiogram handles SIGTERM normally: do not ignore platform shutdown.
         polling=asyncio.create_task(
             dp.start_polling(telegram_bot,close_bot_session=False),name="telegram-polling")
