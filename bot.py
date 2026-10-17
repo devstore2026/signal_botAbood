@@ -130,20 +130,34 @@ async def generate_signal(cb,state):
         book.record(sym,sec,decision.direction,ticks[-1])
 
 
-async def _health(request):
-    return web.Response(text="Abood Trading bot is alive")
+async def handle_ping(request):
+    # Liveness endpoint: a disconnected upstream feed must not trigger a
+    # Render restart loop. Use Telegram /status for feed diagnostics.
+    return web.Response(text="Abood Trading Bot is running!")
 
 
-async def start_health_server():
-    """Tiny HTTP server so Render free web-service deploys stay up."""
-    port = int(os.environ.get("PORT", "10000"))
-    app = web.Application()
-    app.router.add_get("/", _health)
-    app.router.add_get("/health", _health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info("Health server listening on :%s", port)
+async def start_web_server():
+    """Bind PORT before Telegram/network/file startup; caller owns cleanup."""
+    port=int(os.environ.get("PORT", "10000"))
+    if not 0 <= port <= 65535:
+        raise ValueError("PORT must be a valid TCP port")
+    app=web.Application()
+    app.router.add_get("/",handle_ping)
+    app.router.add_get("/health",handle_ping)
+    runner=web.AppRunner(app, access_log=None)
+    try:
+        await runner.setup()
+        site=web.TCPSite(runner,"0.0.0.0",port)
+        await site.start()
+    except BaseException:
+        await runner.cleanup()
+        raise
+    log.info("[Web] Health-check server listening on 0.0.0.0:%s",port)
+    return runner
+
+
+# Backward-compatible name; no second HTTP server is created.
+start_health_server=start_web_server
 
 
 def register_handlers(dp):
@@ -245,27 +259,61 @@ def register_handlers(dp):
             BUSY.discard(key)
 
 async def main():
-    if not config.BOT_TOKEN:
-        raise SystemExit('Set a NEW BOT_TOKEN in local .env first. No old disclosed token is shipped.')
-    cards.build()  # existence check only; do not overwrite supplied banners
-    await book.load()
-    bot=Bot(token=config.BOT_TOKEN)
-    dp=Dispatcher(storage=MemoryStorage())
-    register_handlers(dp)
-    workers=[asyncio.create_task(feed.run()),asyncio.create_task(book.writer()),
-             asyncio.create_task(book.monitor())]
-    await start_health_server()
+    runner=await start_web_server()
+    telegram_bot=None
+    workers=[]
+    polling=None
     try:
-        # Same event loop; no browser automation or order endpoint.
-        await dp.start_polling(bot)
+        if not config.BOT_TOKEN:
+            raise RuntimeError("Set BOT_TOKEN in Render Environment before starting")
+        cards.build()  # validates existing files only
+        await book.load()
+        telegram_bot=Bot(token=config.BOT_TOKEN)
+        dp=Dispatcher(storage=MemoryStorage())
+        register_handlers(dp)
+        workers=[asyncio.create_task(feed.run(),name="market-feed"),
+                 asyncio.create_task(book.writer(),name="paper-writer"),
+                 asyncio.create_task(book.monitor(),name="paper-monitor")]
+        # aiogram handles SIGTERM normally: do not ignore platform shutdown.
+        polling=asyncio.create_task(
+            dp.start_polling(telegram_bot,close_bot_session=False),name="telegram-polling")
+        log.info("[Bot] Running polling; HTTP health server is already listening")
+        done,_=await asyncio.wait([polling,*workers],return_when=asyncio.FIRST_COMPLETED)
+        # Fail visibly if a worker unexpectedly exits instead of leaving a
+        # healthy-looking but nonfunctional process behind.
+        for task in workers:
+            if task in done:
+                log.error("Background worker stopped: %s",task.get_name())
+                raise RuntimeError("Background worker stopped unexpectedly")
+        await polling  # normal aiogram signal stop or propagate polling error
     finally:
-        for task in (workers[0],workers[2]):
-            task.cancel()
-        await asyncio.gather(workers[0],workers[2],return_exceptions=True)
-        await book.queue.join()
-        workers[1].cancel()
-        await asyncio.gather(workers[1],return_exceptions=True)
-        await bot.session.close()
+        log.info("[Shutdown] Stopping tasks and releasing HTTP/Telegram resources")
+        if polling is not None and not polling.done():
+            polling.cancel()
+        for task in workers:
+            if task.get_name() != "paper-writer":
+                task.cancel()
+        stopped=[t for t in workers if t.get_name() != "paper-writer"]
+        if polling is not None:
+            stopped.append(polling)
+        if stopped:
+            await asyncio.gather(*stopped,return_exceptions=True)
+        writer=next((t for t in workers if t.get_name()=="paper-writer"),None)
+        if writer is not None:
+            if not writer.done():
+                try:
+                    await asyncio.wait_for(book.queue.join(),timeout=3)
+                except asyncio.TimeoutError:
+                    log.warning("Paper journal drain timed out during shutdown")
+            writer.cancel()
+            await asyncio.gather(writer,return_exceptions=True)
+        try:
+            if telegram_bot is not None:
+                await telegram_bot.session.close()
+        finally:
+            await runner.cleanup()
+        log.info("[Shutdown] Complete")
+
 if __name__=='__main__':
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
     asyncio.run(main())

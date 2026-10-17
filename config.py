@@ -3,7 +3,8 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 ROOT=Path(__file__).resolve().parent
-load_dotenv(ROOT/'.env', override=True)
+# Render Environment takes precedence over optional local .env values.
+load_dotenv(ROOT/'.env', override=False)
 BOT_TOKEN=os.getenv('BOT_TOKEN','').strip()
 PO_WS_URL=os.getenv('PO_WS_URL','wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket').strip()
 PO_AUTH_FRAME=os.getenv('PO_AUTH_FRAME','').strip()

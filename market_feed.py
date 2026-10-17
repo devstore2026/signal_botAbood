@@ -209,27 +209,25 @@ class MarketFeed:
                     log.warning('Feed connected but SILENT: auth frame required; signals blocked.')
 
     async def run(self):
-        delay=1
+        """Permanent reconnect loop; upstream errors never kill Telegram/HTTP."""
         if not config.PO_AUTH_FRAME:
-            log.warning('No PO_AUTH_FRAME: feed may require a local demo session; signals stay blocked without real ticks')
+            log.warning('PO_AUTH_FRAME is empty; a demo session may be required for live prices')
         while True:
-            start=time.monotonic()
             try:
                 await self.session()
+                self.last_error='Feed closed; retry in 3 seconds'
+                log.warning('%s',self.last_error)
             except asyncio.CancelledError:
-                raise
+                raise  # let Render/aiogram perform a graceful shutdown
             except Exception as exc:
-                # Never log raw frames, tokens, sessions or arbitrary error text.
-                self.last_error=f'Feed disconnected ({type(exc).__name__}); check /status'
+                # Do not log raw exception text: auth/session data may appear.
+                self.last_error=f'Feed disconnected ({type(exc).__name__}); retry in 3 seconds'
                 log.warning('%s',self.last_error)
             finally:
                 self.connected=False
                 self.authenticated=False
                 self.ws=None
-                # Never mix windows from separate connections.
+                self.decoder.reset()
                 self.ticks.clear()
                 self.last_received.clear()
-            if time.monotonic()-start>30:
-                delay=1
-            await asyncio.sleep(delay)
-            delay=min(delay*2,20)
+            await asyncio.sleep(3)
