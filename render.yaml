@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: abood-trading-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PO_WS_URL
+        value: wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket
+      - key: PO_AUTH_FRAME
+        sync: false
