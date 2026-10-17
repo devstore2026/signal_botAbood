@@ -15,3 +15,5 @@ services:
         value: wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket
       - key: PO_AUTH_FRAME
         sync: false
+      - key: SELF_URL
+        sync: false

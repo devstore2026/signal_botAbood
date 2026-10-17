@@ -35,6 +35,7 @@ class Flow(StatesGroup):
 feed=MarketFeed()
 book=PaperBook()
 feed.on_tick=book.tick
+SELF_URL = os.environ.get('SELF_URL', '')
 FILE_IDS={}
 BUSY=set()
 LAST_REQUEST={}
@@ -134,6 +135,22 @@ async def handle_ping(request):
     # Liveness endpoint: a disconnected upstream feed must not trigger a
     # Render restart loop. Use Telegram /status for feed diagnostics.
     return web.Response(text="Abood Trading Bot is running!")
+
+
+async def keep_alive():
+    """Ping own /health so Render free tier never spins down from inactivity."""
+    if not SELF_URL:
+        return
+    import aiohttp
+    url = SELF_URL.rstrip('/') + '/health'
+    while True:
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    log.info('Keep-alive ping -> %s', r.status)
+        except Exception as e:
+            log.warning('Keep-alive ping failed: %s', type(e).__name__)
+        await asyncio.sleep(240)  # every 4 min, well under the 15-min idle limit
 
 
 async def start_web_server():
