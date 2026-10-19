@@ -25,3 +25,11 @@ SIGNAL_COOLDOWN=number('SIGNAL_COOLDOWN',5,1,60)
 ANALYSIS_MIN = number('ANALYSIS_MIN', 1.0, 0.0, 10.0)
 ANALYSIS_MAX = number('ANALYSIS_MAX', 3.0, 0.5, 10.0)
 DATA_DIR=ROOT/'data'
+
+# Experimental S5 model: engineering defaults, not statistically optimized.
+S5_WINDOW_SECONDS=number('S5_WINDOW_SECONDS',20,8,120)
+S5_MIN_SPAN=number('S5_MIN_SPAN',5,2,30)
+S5_MIN_TICKS=number('S5_MIN_TICKS',30,8,1000,True)
+S5_MIN_QUALITY=number('S5_MIN_QUALITY',65,0,100)
+# False preserves continuous requests on valid data. True skips weak setups.
+S5_STRICT_FILTER=os.getenv('S5_STRICT_FILTER','false').strip().lower() in ('true','1','yes')

@@ -113,32 +113,30 @@ async def generate_signal(cb,state):
         return
     loading=await loading_text(cb.message)
     await state.update_data(active_message=loading.message_id)
-    # No artificial 2-second 'analysis'. Use only current in-memory data.
-    ticks0 = feed.get_ticks(sym)
-    ticks0 = [t for t in ticks0 if t[0] >= now0 - config.MAX_TICK_AGE * 4] if 'now0' in dir() else ticks0
-    # Meta-style analysis window: wait 1-3s to gather fresh ticks before deciding
-    import asyncio as _a
-    await _a.sleep(_random.uniform(1.0, 3.0))
+    # Preserve the existing UX pause, but now respect its configuration.
+    await asyncio.sleep(_random.uniform(config.ANALYSIS_MIN, config.ANALYSIS_MAX))
+    now = time.time()
+    # The S5 engine owns time-window selection; do not truncate it to 8 seconds.
     ticks = feed.get_ticks(sym)
-    fresh = [t for t in ticks if time.time() - t[0] <= config.MAX_TICK_AGE * 4]
-    if fresh:
-        ticks = fresh
-    decision = strategy.decide(ticks, sec)
-    # freeze-guard: never resend an identical frozen card for the same pair+duration
-    key = (sym, sec)
-    if len(ticks) < 3 and key in LAST_SIGNAL and LAST_SIGNAL[key][0] == decision.direction:
-        # nudge: recompute from momentum of any ticks we do have, else flip
-        decision = strategy.Decision("DOWN" if decision.direction == "UP" else "UP",
-                                     decision.votes, decision.rsi)
-    LAST_SIGNAL[key] = (decision.direction, None)
-    # no-entry branches removed per spec: a card is ALWAYS produced.
-    acc = min(80, 55 + decision.votes * 3 + (3 if decision.votes >= 6 else 0))
+    decision = strategy.decide(ticks, sec, now=now)
+    if sec == 5 and (decision.reason.startswith('DATA:') or
+                    (config.S5_STRICT_FILTER and not decision.eligible)):
+        text = ("Research signal withheld\n\n"
+                f"Asset: {name(sym)}\nDuration: {duration_label(sec)}\n"
+                f"Reason: {decision.reason}\n"
+                "No random direction or fabricated accuracy is substituted.")
+        out = await show_screen(loading, 'confirmation', text, signal_keyboard())
+        await activate(state, out, Flow.signal)
+        return
+    # No forced direction flipping. A repeated direction can be legitimate.
+    measured = book.summary(sym, sec)
     text = ("Trading signal\n\n"
             f"Asset: {name(sym)}\n"
             f"Duration: {duration_label(sec)}\n"
             f"Current time (UTC+3): {datetime.now(TZ).strftime('%H:%M:%S')}\n"
             f"Direction: {decision.direction}\n"
-            f"Accuracy rate: {acc}%")
+            f"Confluence: {decision.votes}/8 (not a win probability)\n"
+            f"Accuracy rate: {measured}")
     # Ensure freshness immediately before delivering a five-second signal.
     out=await show_screen(loading,'buy' if decision.direction=='UP' else 'sell',text,signal_keyboard())
     await activate(state,out,Flow.signal)
