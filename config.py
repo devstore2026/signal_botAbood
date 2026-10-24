@@ -25,3 +25,10 @@ SIGNAL_COOLDOWN=number('SIGNAL_COOLDOWN',5,1,60)
 ANALYSIS_MIN = number('ANALYSIS_MIN', 1.0, 0.0, 10.0)
 ANALYSIS_MAX = number('ANALYSIS_MAX', 3.0, 0.5, 10.0)
 DATA_DIR=ROOT/'data'
+
+# Real analysis window; source data is sampled during this interval.
+if ANALYSIS_MAX < ANALYSIS_MIN:
+    raise ValueError('ANALYSIS_MAX must be >= ANALYSIS_MIN')
+FRESH_TICKS_REQUIRED = number('FRESH_TICKS_REQUIRED', 3, 1, 30, True)
+MIN_CONFIRMATIONS = number('MIN_CONFIRMATIONS', 5, 4, 6, True)
+SIGNAL_DB = Path(os.getenv('SIGNAL_DB', str(DATA_DIR/'signals.sqlite3')))

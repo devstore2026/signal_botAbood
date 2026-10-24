@@ -1,134 +1,155 @@
-"""strategy.py - Strengthened instant decision engine (Meta-Trading style).
-
-ALWAYS returns UP or DOWN - never "no signal". Dense multi-indicator
-confluence tuned for 5-second OTC scalps: EMA stack, slope, momentum,
-acceleration, MACD histogram, RSI zone, Stochastic, and tick-order flow.
+"""Experimental time-based M1 context + micro momentum, not a win predictor.
+No random signals and no automatic alternation to fabricate variety.
 """
-import math
-import random
-import time
 from dataclasses import dataclass
-from typing import List, Tuple
-
+import math
+import statistics
+import time
 import config
-
-PROFILE = 'live_confluence_v2'
-
-Tick = Tuple[float, float]
-
+PROFILE=f'm1_micro_v3:c{config.MIN_CONFIRMATIONS}:fresh{config.FRESH_TICKS_REQUIRED}'
 
 @dataclass(frozen=True)
 class Decision:
-    direction: str
-    votes: int = 0
-    rsi: float = 50.0
+    direction: str | None
+    votes: int=0
+    rsi: float=50.0
+    reason: str=''
+    source_ts: float=0.0
+    minute_speed: float=0.0
+    minute_volatility: float=0.0
+    micro_speed: float=0.0
 
-
-def ema(values, period):
-    v = values[0]
-    a = 2 / (period + 1)
+def ema(values,period):
+    value=values[0]
+    alpha=2/(period+1)
     for x in values[1:]:
-        v += a * (x - v)
-    return v
+        value+=alpha*(x-value)
+    return value
 
+def rsi(values,period=7):
+    changes=[b-a for a,b in zip(values,values[1:])][-period:]
+    gains=sum(max(x,0) for x in changes)
+    losses=sum(max(-x,0) for x in changes)
+    return (100 if gains else 50) if losses==0 else 100-100/(1+gains/losses)
 
-def rsi(values, period=7):
-    ch = [b - a for a, b in zip(values, values[1:])][-period:]
-    g = sum(max(d, 0) for d in ch)
-    l = sum(max(-d, 0) for d in ch)
-    if l == 0:
-        return 100.0 if g else 50.0
-    return 100 - 100 / (1 + g / l)
-
-
-def _macd_hist(values, f=12, s=26, sig=9):
-    if len(values) < s + 2:
+def slope(ticks):
+    if len(ticks)<2:
         return 0.0
-    line = ema(values, f) - ema(values, s)
-    pts = [ema(values[:i + 1], f) - ema(values[:i + 1], s)
-           for i in range(max(s, len(values) - sig), len(values))]
-    return line - (sum(pts) / len(pts) if pts else line)
+    # Actual seconds, not tick indices: quote arrival frequency can vary.
+    origin=ticks[0][0]
+    times=[t-origin for t,_ in ticks]
+    prices=[p for _,p in ticks]
+    tm,pm=statistics.fmean(times),statistics.fmean(prices)
+    denom=sum((t-tm)**2 for t in times)
+    return sum((t-tm)*(p-pm) for t,p in zip(times,prices))/denom if denom else 0.0
 
+def bars(ticks,width,now):
+    result={}
+    current=int(now//width)
+    for t,p in ticks:
+        bucket=int(t//width)
+        if bucket<current:
+            result[bucket]=p
+    return sorted(result.items())
 
-def _stoch(values, period=14):
-    if len(values) < period:
-        return 50.0
-    w = values[-period:]
-    lo, hi, last = min(w), max(w), w[-1]
-    return 50.0 if hi == lo else (last - lo) / (hi - lo) * 100.0
-
-
-def decide(ticks: List[Tick], duration_seconds: int, now=None) -> Decision:
-    now = time.time() if now is None else now
-    clean = []
+def decide(ticks,duration_seconds,now=None):
+    now=time.time() if now is None else now
+    def no(reason):
+        return Decision(None,reason=reason)
+    if len(ticks)<10:
+        return no('Insufficient live quotes; no random direction')
     try:
-        for t, p in ticks:
-            t, p = float(t), float(p)
-            if math.isfinite(t) and math.isfinite(p) and p > 0:
-                clean.append((t, p))
-    except (TypeError, ValueError):
-        clean = []
-
-    if len(clean) < 3:
-        return Decision(random.choice(("UP", "DOWN")), 0, 50.0)
-
-    prices = [p for _, p in clean]
-
-    # ---- sparse data: quick multi-signal tick heuristic ----
-    if len(clean) < config.MIN_TICKS:
-        w = prices[-min(12, len(prices)):]
-        vel = w[-1] - w[0]
-        mid = len(w) // 2
-        accel = (w[-1] - w[mid]) - (w[mid] - w[0])
-        ef, es = ema(w, 3), ema(w, 8)
-        # order flow: net up vs down tick count
-        ups = sum(1 for a, b in zip(w, w[1:]) if b > a)
-        dns = sum(1 for a, b in zip(w, w[1:]) if b < a)
-        flow = ups - dns
-        score = ((1 if vel > 0 else -1 if vel < 0 else 0)
-                 + (1 if accel > 0 else -1 if accel < 0 else 0)
-                 + (1 if ef > es else -1 if ef < es else 0)
-                 + (1 if flow > 0 else -1 if flow < 0 else 0))
-        if score == 0:
-            score = 1 if prices[-1] >= prices[-2] else -1
-        d = "UP" if score > 0 else "DOWN"
-        return Decision(d, min(abs(score), 4), rsi(prices))
-
-    # ---- full confluence (8 confirmations) ----
-    width = max(1, int(duration_seconds) // 10)
-    buckets = {}
-    cur = int(now // width)
-    for t, p in clean:
-        b = int(t // width)
-        if b < cur:
-            buckets[b] = p
-    bars = sorted(buckets.items())[-80:]
-    closes = [p for _, p in bars] if len(bars) >= 8 else prices[-60:]
-
-    e5, e13, e34 = ema(closes, 5), ema(closes, 13), ema(closes, 34)
-    direction = "UP" if e13 >= e34 else "DOWN"
-    s = 1 if direction == "UP" else -1
-    mom = closes[-1] - closes[min(5, len(closes) - 1)]
-    mi = len(closes) // 2
-    accel = (closes[-1] - closes[mi]) - (closes[mi] - closes[0])
-    rv = rsi(closes)
-    macd_h = _macd_hist(closes)
-    sto = _stoch(closes)
-    ups = sum(1 for a, b in zip(closes, closes[1:]) if b > a)
-    dns = sum(1 for a, b in zip(closes, closes[1:]) if b < a)
-    flow = ups - dns
-
-    checks = [
-        s * (e5 - e13) > 0,
-        s * (e13 - e34) > 0,
-        s * (e13 - ema(closes[:-3], 13)) > 0 if len(closes) > 16 else False,
-        s * mom > 0,
-        s * accel > 0,
-        s * macd_h > 0,
-        (50 < rv < 85) if s == 1 else (15 < rv < 50),
-        (sto > 50) if s == 1 else (sto < 50),
-    ]
-    votes = sum(checks)
-    if s * flow < 0:  # order-flow disagreement trims one vote
-        votes = max(0, votes - 1)
-    return Decision(direction, votes, rv)
+        if any(not math.isfinite(t) or not math.isfinite(p) or p<=0 for t,p in ticks):
+            return no('Invalid quote data')
+        if any(b[0]<=a[0] for a,b in zip(ticks,ticks[1:])):
+            return no('Unordered quote timestamps')
+    except (TypeError,ValueError):
+        return no('Invalid quote data')
+    if not 0<=now-ticks[-1][0]<=config.MAX_TICK_AGE:
+        return no('Live quotes are stale; check /status')
+    # At least 60 seconds of actual observations for M1 context. No fake
+    # minute candle made from five ticks. Completed bars only for EMA/RSI.
+    if ticks[-1][0]-ticks[0][0]<60:
+        return no('Collecting 60 seconds of real M1 context')
+    minute=[x for x in ticks if now-60<=x[0]<=now]
+    if len(minute)<20 or minute[-1][0]-minute[0][0]<55:
+        return no('M1 context is incomplete')
+    context=bars(minute,1,now)
+    if len(context)<40:
+        return no('Not enough observed seconds in M1 context')
+    if any(b[0]-a[0]>3 for a,b in zip(context,context[1:])):
+        return no('Quote gaps in M1 context')
+    closes=[p for _,p in context]
+    changes=[b-a for a,b in zip(closes,closes[1:])]
+    nonzero=[abs(d) for d in changes if d]
+    if not nonzero:
+        return no('Flat market')
+    typical=statistics.median(nonzero)
+    if abs(changes[-1])>5*typical:
+        return no('Isolated price spike; no chase entry')
+    minute_speed=slope(minute)
+    volatility=statistics.pstdev(changes)
+    if duration_seconds<=30:
+        width=max(3,min(10,int(duration_seconds)))
+        micro=[x for x in ticks if now-width<=x[0]<=now]
+        prior=[x for x in ticks if now-2*width<=x[0]<now-width]
+        if len(micro)<5 or micro[-1][0]-micro[0][0]<width*0.65:
+            return no('Not enough fresh micro-window quotes')
+        micro_speed=slope(micro)
+        prior_speed=slope(prior)
+        points=[p for _,p in micro]
+        efast,eslow=ema(points,3),ema(points,8)
+        deltas=[b-a for a,b in zip(points,points[1:])]
+        absolute=sum(abs(d) for d in deltas)
+        efficiency=abs(points[-1]-points[0])/absolute if absolute else 0
+        if efficiency<0.25:
+            return no('Micro-window is too choppy')
+        trend=ema(closes,5)-ema(closes,13)
+        if trend==0 or micro_speed==0 or trend*micro_speed<=0:
+            return no('M1 direction and micro momentum disagree')
+        direction='UP' if micro_speed>0 else 'DOWN'
+        sign=1 if direction=='UP' else -1
+        # A collapse/reversal of local speed cannot be repaired by counting
+        # more correlated indicators. Require stability instead.
+        acceleration=micro_speed-prior_speed
+        if sign*acceleration< -2*abs(micro_speed):
+            return no('Micro momentum is decelerating sharply')
+        rv=rsi(closes)
+        flow=sum(1 if d>0 else -1 if d<0 else 0 for d in deltas)
+        lo,hi=min(closes),max(closes)
+        position=(points[-1]-lo)/(hi-lo) if hi>lo else 0.5
+        checks=[sign*minute_speed>0,
+                sign*micro_speed>0,
+                sign*(efast-eslow)>0,
+                sign*flow>0,
+                position>0.55 if sign==1 else position<0.45,
+                45<rv<85 if sign==1 else 15<rv<55]
+    else:
+        # Slower expiries use proportionate real time windows, not the same
+        # handful of ticks as a five-second scalp.
+        required=max(120,2*int(duration_seconds))
+        if ticks[-1][0]-ticks[0][0]<required:
+            return no(f'Need {required}s of source history for this expiry')
+        width=max(5,int(duration_seconds)//12)
+        slow=bars([x for x in ticks if now-required<=x[0]<=now],width,now)
+        if len(slow)<24 or any(b[0]-a[0]>1 for a,b in zip(slow,slow[1:])):
+            return no('Incomplete slow-timeframe bars')
+        values=[p for _,p in slow]
+        trend=ema(values,5)-ema(values,13)
+        if not trend:
+            return no('No slow-timeframe trend')
+        direction='UP' if trend>0 else 'DOWN'
+        sign=1 if direction=='UP' else -1
+        rv=rsi(values)
+        micro_speed=slope([(float(t*width),p) for t,p in slow[-6:]])
+        recent=[b-a for a,b in zip(values[-7:],values[-6:])]
+        checks=[sign*trend>0,sign*micro_speed>0,
+                sign*(ema(values,13)-ema(values,21))>0,
+                sign*minute_speed>0,
+                sign*sum(recent)>0,
+                45<rv<85 if sign==1 else 15<rv<55]
+    votes=sum(checks)
+    if votes<config.MIN_CONFIRMATIONS:
+        return no(f'Indicators conflict ({votes}/6); no confirmed setup')
+    return Decision(direction,votes,rv,'M1 context + time-based momentum',
+                    ticks[-1][0],minute_speed,volatility,micro_speed)
