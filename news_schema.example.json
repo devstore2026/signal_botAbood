@@ -1,0 +1,16 @@
+{
+  "source": "",
+  "updated_at": 0,
+  "covered_from": 0,
+  "covered_until": 0,
+  "covered_symbols": [],
+  "blackouts": [
+    {
+      "symbols": [
+        "EURUSD"
+      ],
+      "start": 0,
+      "end": 0
+    }
+  ]
+}

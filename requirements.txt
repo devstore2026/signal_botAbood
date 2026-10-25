@@ -1,5 +1,4 @@
 aiogram>=3.7,<4
+aiohttp>=3.9,<4
 websockets>=12,<16
 python-dotenv>=1,<2
-Pillow>=10,<13
-aiohttp>=3.9,<4
