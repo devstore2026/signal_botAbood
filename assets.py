@@ -41,14 +41,3 @@ OTC_ASSETS = [
 # Fast lookup helpers
 BY_SYMBOL = {sym: name for name, sym in OTC_ASSETS}
 BY_NAME = {name: sym for name, sym in OTC_ASSETS}
-
-import re
-FX_CODES = frozenset('USD EUR GBP JPY CHF CAD AUD NZD BRL MXN INR CNY CNH HKD SGD ZAR TRY RUB NOK SEK DKK PLN CZK HUF RON BGN ILS SAR AED QAR KWD BHD OMR THB IDR MYR PHP KRW TWD VND CLP COP ARS PEN UYU EGP NGN KES PKR BDT LKR UAH KZT MAD TND ISK'.split())
-def normalize_fx(symbol):
-    raw=re.sub(r'[^A-Za-z]','',str(symbol)).upper()
-    if not raw.endswith('OTC'):
-        return None
-    pair=raw[:-3]
-    if len(pair)!=6 or pair[:3] not in FX_CODES or pair[3:] not in FX_CODES or pair[:3]==pair[3:]:
-        return None
-    return pair+'_otc'

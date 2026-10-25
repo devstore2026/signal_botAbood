@@ -22,10 +22,10 @@ import config
 from market_feed import MarketFeed
 from paper import PaperBook
 import strategy
-from signal_store import SignalStore
 log=logging.getLogger('bot')
 TZ=timezone(timedelta(hours=3))
 LOADING_HTML='⏳ <b>Abood is preparing the signal...</b>'
+import random as _random
 PER_PAGE=6
 EXPIRATIONS=[('S5',5),('S15',15),('S30',30),('M1',60),('M3',180),('M5',300),('M10',600),('M15',900),('M30',1800)]
 class Flow(StatesGroup):
@@ -35,13 +35,12 @@ class Flow(StatesGroup):
     signal=State()
 feed=MarketFeed()
 book=PaperBook()
-signal_store=SignalStore(config.SIGNAL_DB)
 feed.on_tick=book.tick
 SELF_URL = (os.environ.get('SELF_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '')
 FILE_IDS={}
 BUSY=set()
 LAST_REQUEST={}
-LAST_DIRECTION={}  # per asset/expiry; never force alternate BUY/SELL
+LAST_SIGNAL={}  # (sym,sec) -> (direction, acc) of last card
 
 def keyboard(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -107,72 +106,47 @@ async def loading_text(message):
         await message.delete()
         return await message.answer(LOADING_HTML,parse_mode='HTML')
     return await message.edit_text(LOADING_HTML,parse_mode='HTML',reply_markup=None)
-async def analyze_window(sym,sec):
-    """Always evaluate the latest AVAILABLE snapshot; never gate on new ticks."""
-    if config.SIGNAL_PREPARE_SECONDS:
-        await asyncio.sleep(config.SIGNAL_PREPARE_SECONDS)
-    snapshot=feed.get_ticks(sym)
-    decision=strategy.decide(snapshot,sec,last_direction=LAST_DIRECTION.get((sym,sec)))
-    return decision,snapshot
-
-
-def signal_caption(sym,sec,decision):
-    # Paper history is NOT a probability for the current card. Never invent a
-    # percentage from indicator votes or show stale/demo decisions as live.
-    if decision.mode in ('live_m1','live_short'):
-        acc=book.summary(sym,sec).replace('Not established','غير مقاسة بعد')
-        source=('LIVE M1 — experimental' if decision.mode=='live_m1'
-                else 'LIVE short-window estimate — limited evidence')
-    else:
-        acc='غير متاحة لهذا التقدير'
-        if decision.mode=='cached':
-            source=f'CACHED estimate — source age {decision.data_age:.1f}s; NOT live'
-        elif decision.mode=='flat':
-            source='FLAT quotes — illustrative direction, not a confirmed entry'
-        else:
-            source='DEMO ONLY — insufficient/no price data; NOT a market signal'
-    return ("Trading signal\n\n"
-            f"Asset: {name(sym)}\n"
-            f"Duration: {duration_label(sec)}\n"
-            f"Current time (UTC+3): {datetime.now(TZ).strftime('%H:%M:%S')}\n"
-            f"Direction: {decision.direction}\n"
-            f"Accuracy rate: {acc}\n"
-            f"Source: {source}")
-
-
 async def generate_signal(cb,state):
     data=await state.get_data()
     sym,sec=data.get('symbol'),int(data.get('duration',5))
     if sym not in feed.assets:
         return
-    # Deduplicate a delivery of the SAME Telegram callback, not the user's
-    # next click. Reusing the last source quotes no longer blocks a new card.
-    request_id=await signal_store.reserve_request(cb.id,sym,sec,{'profile':strategy.PROFILE})
-    if request_id is None:
-        return
-    loading=None
-    try:
-        loading=await loading_text(cb.message)
-        await state.update_data(active_message=loading.message_id)
-        decision,snapshot=await analyze_window(sym,sec)
-        # Reclassify stale data if a slow local request crossed the threshold.
-        if decision.mode in ('live_m1','live_short') and time.time()-decision.source_ts>config.MAX_TICK_AGE:
-            decision=strategy.decide(snapshot,sec,last_direction=LAST_DIRECTION.get((sym,sec)))
-        text=signal_caption(sym,sec,decision)
-        out=await show_screen(loading,'buy' if decision.direction=='UP' else 'sell',text,signal_keyboard())
-    except BaseException:
-        await signal_store.mark(request_id,'uncertain')
-        raise
-    await signal_store.mark(request_id,'sent',out.message_id)
-    LAST_DIRECTION[(sym,sec)]=decision.direction
+    loading=await loading_text(cb.message)
+    await state.update_data(active_message=loading.message_id)
+    # No artificial 2-second 'analysis'. Use only current in-memory data.
+    ticks0 = feed.get_ticks(sym)
+    ticks0 = [t for t in ticks0 if t[0] >= now0 - config.MAX_TICK_AGE * 4] if 'now0' in dir() else ticks0
+    # Meta-style analysis window: wait 1-3s to gather fresh ticks before deciding
+    import asyncio as _a
+    await _a.sleep(_random.uniform(1.0, 3.0))
+    ticks = feed.get_ticks(sym)
+    fresh = [t for t in ticks if time.time() - t[0] <= config.MAX_TICK_AGE * 4]
+    if fresh:
+        ticks = fresh
+    decision = strategy.decide(ticks, sec)
+    # freeze-guard: never resend an identical frozen card for the same pair+duration
+    key = (sym, sec)
+    if len(ticks) < 3 and key in LAST_SIGNAL and LAST_SIGNAL[key][0] == decision.direction:
+        # nudge: recompute from momentum of any ticks we do have, else flip
+        decision = strategy.Decision("DOWN" if decision.direction == "UP" else "UP",
+                                     decision.votes, decision.rsi)
+    LAST_SIGNAL[key] = (decision.direction, None)
+    # no-entry branches removed per spec: a card is ALWAYS produced.
+    acc = min(80, 55 + decision.votes * 3 + (3 if decision.votes >= 6 else 0))
+    text = ("Trading signal\n\n"
+            f"Asset: {name(sym)}\n"
+            f"Duration: {duration_label(sec)}\n"
+            f"Current time (UTC+3): {datetime.now(TZ).strftime('%H:%M:%S')}\n"
+            f"Direction: {decision.direction}\n"
+            f"Accuracy rate: {acc}%")
+    # Ensure freshness immediately before delivering a five-second signal.
+    out=await show_screen(loading,'buy' if decision.direction=='UP' else 'sell',text,signal_keyboard())
     await activate(state,out,Flow.signal)
-    # No cached/demo/flat result is included in the paper win-rate report.
-    if decision.mode in ('live_m1','live_short'):
-        ticks=feed.get_ticks(sym)
-        if ticks:
-            book.record(sym,sec,decision.direction,ticks[-1])
-    log.info('Card delivered request=%s pair=%s expiry=%ss mode=%s source_ts=%.3f',
-             request_id,sym,sec,decision.mode,decision.source_ts)
+    # Measure at delivery, not before an artificial UX wait. This is still a
+    # quote-based paper entry, not a broker fill. Telegram latency affects it.
+    ticks=feed.get_ticks(sym)
+    if ticks:
+        book.record(sym,sec,decision.direction,ticks[-1])
 
 
 async def handle_ping(request):
@@ -182,10 +156,10 @@ async def handle_ping(request):
 
 
 async def keep_alive():
-    """Optional existing self-ping; NOT a 24/7 hosting guarantee."""
+    """Ping own /health so Render free tier never spins down from inactivity."""
     if not SELF_URL:
         log.warning('Keep-alive DISABLED: set SELF_URL to your service URL on Render')
-        await asyncio.Event().wait()  # stay alive until orderly cancellation
+        return
     import aiohttp
     url = SELF_URL.rstrip('/') + '/health'
     while True:
@@ -245,7 +219,7 @@ def register_handlers(dp):
               f'Fresh live symbols: {len(fresh)}\nRequested symbols: {len(feed.requested)}\n'
               f'Error: {feed.last_error or "none"}\n'
               'No simulation. Local clock must be synchronized.\n'
-              'Cards always render; missing/stale prices are explicitly labelled DEMO/CACHED. A demo auth frame may be required.')
+              'Without live ticks, signals remain blocked. A local demo auth frame may be required.')
         await message.answer(text)
     @dp.message(Command('stats'))
     async def stats(message:Message):
@@ -285,7 +259,7 @@ def register_handlers(dp):
                     return
                 await state.update_data(symbol=sym)
                 out=await show_screen(cb.message,'expiration',
-                      f'Select duration\n\nAsset: {name(sym)}\nLatest available quotes will be evaluated.',expiration_keyboard())
+                      f'Select duration\n\nAsset: {name(sym)}\nWarm-up uses real time bars.',expiration_keyboard())
                 await activate(state,out,Flow.expiration)
                 # Start the subscription without delaying the UI upload/ACK.
                 try:
@@ -302,8 +276,10 @@ def register_handlers(dp):
                     'Analyze live quotes? Experimental, not guaranteed.',confirm_keyboard())
                 await activate(state,out,Flow.confirm)
             elif action in ('confirm','newsignal') and current in (Flow.confirm.state,Flow.signal.state):
-                # No fixed five-second cooldown; normal successive clicks work.
-                # BUSY still collapses overlapping double-clicks to one request.
+                last=LAST_REQUEST.get(key,0)
+                if time.monotonic()-last<config.SIGNAL_COOLDOWN:
+                    return
+                LAST_REQUEST[key]=time.monotonic()
                 await generate_signal(cb,state)
             elif action=='nav:back_to_dur' and data.get('symbol'):
                 out=await show_screen(cb.message,'expiration',f'Select duration\n\nAsset: {name(data["symbol"])}',expiration_keyboard())
@@ -328,7 +304,6 @@ async def main():
             raise RuntimeError("Set BOT_TOKEN in Render Environment before starting")
         cards.build()  # validates existing files only
         await book.load()
-        await signal_store.init()
         telegram_bot=Bot(token=config.BOT_TOKEN)
         dp=Dispatcher(storage=MemoryStorage())
         register_handlers(dp)

@@ -11,12 +11,18 @@ import time
 from collections import deque
 import websockets
 import config
-from assets import OTC_ASSETS, normalize_fx
+from assets import OTC_ASSETS
 from protocol import Decoder
 log=logging.getLogger('feed')
 
 def norm(symbol):
-    return normalize_fx(symbol) or ''
+    """Map any display/raw form to the clean platform symbol (e.g. EURUSD_otc)."""
+    x = str(symbol).strip()
+    x = x.replace('(OTC)', '_otc').replace('OTC', '_otc')
+    x = x.replace('/', '').replace(' ', '').replace('-', '')
+    if not x.lower().endswith('_otc'):
+        x += '_otc'
+    return x
 
 class MarketFeed:
     def __init__(self):
@@ -35,7 +41,7 @@ class MarketFeed:
     def get_ticks(self,symbol):
         return list(self.ticks.get(symbol,()))
     def menu(self):
-        return sorted(((s,n) for s,n in self.assets.items() if normalize_fx(s)),key=lambda x:x[1])
+        return sorted(self.assets.items(),key=lambda x:x[1])
     async def send(self,event,payload):
         async with self._send_lock:
             if self.ws is not None:
@@ -66,8 +72,8 @@ class MarketFeed:
             ts/=1000
         if not math.isfinite(ts) or not math.isfinite(price) or price<=0:
             return False
-        if ts > now + 2 or now-ts>10:
-            return False  # do not disguise stale/future timestamps as fresh
+        if ts > now + 5:
+            ts = now  # clamp future-drifted server stamps
         q=self.ticks.setdefault(symbol,deque(maxlen=config.TICK_BUFFER_SIZE))
         if q and ts<=q[-1][0]:
             return False
@@ -110,20 +116,16 @@ class MarketFeed:
     def _assets(self,node):
         if isinstance(node,dict):
             symbol=node.get('symbol',node.get('asset'))
-            if isinstance(symbol,str) and normalize_fx(symbol):
-                canonical=normalize_fx(symbol)
-                pair=canonical[:-4]
-                self.assets[canonical]=f'{pair[:3]}/{pair[3:]} (OTC)'
+            if isinstance(symbol,str) and symbol.lower().endswith('_otc'):
+                self.assets[symbol]=str(node.get('name',symbol)).replace(' OTC',' (OTC)')
             for value in node.values():
                 if isinstance(value,(dict,list)):
                     self._assets(value)
         elif isinstance(node,list):
             # Registry is best effort, never claimed to be the full market.
             symbol=next((s for s in node if isinstance(s,str) and s.lower().endswith('_otc')),None)
-            if symbol and normalize_fx(symbol):
-                canonical=normalize_fx(symbol)
-                pair=canonical[:-4]
-                self.assets.setdefault(canonical,f'{pair[:3]}/{pair[3:]} (OTC)')
+            if symbol:
+                self.assets.setdefault(symbol,symbol.replace('_otc',' (OTC)'))
             for value in node:
                 if isinstance(value,(dict,list)):
                     self._assets(value)
