@@ -6,7 +6,7 @@ import math
 import statistics
 import time
 import config
-PROFILE=f'm1_micro_v3:c{config.MIN_CONFIRMATIONS}:fresh{config.FRESH_TICKS_REQUIRED}'
+PROFILE='continuous_m1_micro_v4'
 
 @dataclass(frozen=True)
 class Decision:
@@ -18,6 +18,8 @@ class Decision:
     minute_speed: float=0.0
     minute_volatility: float=0.0
     micro_speed: float=0.0
+    mode: str='live_m1'
+    data_age: float | None=None
 
 def ema(values,period):
     value=values[0]
@@ -52,7 +54,7 @@ def bars(ticks,width,now):
             result[bucket]=p
     return sorted(result.items())
 
-def decide(ticks,duration_seconds,now=None):
+def selective_decide(ticks,duration_seconds,now=None):
     now=time.time() if now is None else now
     def no(reason):
         return Decision(None,reason=reason)
@@ -153,3 +155,67 @@ def decide(ticks,duration_seconds,now=None):
         return no(f'Indicators conflict ({votes}/6); no confirmed setup')
     return Decision(direction,votes,rv,'M1 context + time-based momentum',
                     ticks[-1][0],minute_speed,volatility,micro_speed)
+
+
+def decide(ticks,duration_seconds,now=None,last_direction=None):
+    """Always return a card direction, with explicit data quality.
+
+    Full M1 confluence when valid; otherwise an uncalibrated short-window
+    heuristic. With no data, return an explicitly DEMO-only placeholder,
+    never fabricate market prices or claim the placeholder is an analysis.
+    """
+    now=time.time() if now is None else now
+    valid={}
+    for row in ticks or []:
+        try:
+            t,p=float(row[0]),float(row[1])
+        except (TypeError,ValueError,IndexError,KeyError):
+            continue
+        if math.isfinite(t) and math.isfinite(p) and p>0 and t<=now:
+            valid[t]=p
+    clean=sorted(valid.items())
+    default=last_direction if last_direction in ('UP','DOWN') else 'UP'
+    if not clean:
+        return Decision(default,reason='DEMO ONLY: no source prices; direction is not market analysis',
+                        mode='demo',data_age=None)
+    age=now-clean[-1][0]
+    if len(clean)<2:
+        return Decision(default,reason='One quote cannot determine movement; illustrative direction',
+                        source_ts=clean[-1][0],mode='demo',data_age=age)
+    if age<=config.MAX_TICK_AGE:
+        full=selective_decide(clean,duration_seconds,now)
+        if full.direction is not None:
+            from dataclasses import replace
+            return replace(full,mode='live_m1',data_age=age)
+    # Evaluate relative to LAST SOURCE TIME, never stamp old quotes as new.
+    end=clean[-1][0]
+    long=[x for x in clean if x[0]>=end-max(60,min(int(duration_seconds),1800))]
+    short=[x for x in long if x[0]>=end-max(3,min(int(duration_seconds),30))]
+    if len(short)<2:
+        short=long[-min(10,len(long)):]
+    points=[p for _,p in short]
+    deltas=[b-a for a,b in zip(points,points[1:])]
+    if not any(deltas):
+        return Decision(default,reason='Flat quotes: no directional evidence; illustrative direction',
+                        source_ts=end,mode='flat',data_age=age)
+    fast_slope=slope(short)
+    slow_slope=slope(long)
+    ef,es=ema(points,3),ema(points,8)
+    flow=sum(1 if d>0 else -1 if d<0 else 0 for d in deltas)
+    rv=rsi([p for _,p in long])
+    # Simple votes are NOT probability estimates. Short-window evidence is
+    # weighted more heavily for 5-second cards, context more for long expiry.
+    signals=[fast_slope,ef-es,flow,points[-1]-points[0],slow_slope,rv-50]
+    weights=[3,2,1,2,1,1] if duration_seconds<=30 else [1,1,1,1,4,2]
+    signed=[1 if x>0 else -1 if x<0 else 0 for x in signals]
+    score=sum(w*v for w,v in zip(weights,signed))
+    if score==0:
+        score=1 if next((d for d in reversed(deltas) if d),0)>0 else -1
+    direction='UP' if score>0 else 'DOWN'
+    side=1 if direction=='UP' else -1
+    votes=sum(v==side for v in signed)
+    mode='live_short' if age<=config.MAX_TICK_AGE else 'cached'
+    changes=[b[1]-a[1] for a,b in zip(long,long[1:])]
+    vol=statistics.pstdev(changes) if len(changes)>1 else 0.0
+    return Decision(direction,votes,rv,'Short-window EMA + velocity + tick imbalance + RSI',
+                    end,slow_slope,vol,fast_slope,mode,age)

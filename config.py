@@ -32,3 +32,6 @@ if ANALYSIS_MAX < ANALYSIS_MIN:
 FRESH_TICKS_REQUIRED = number('FRESH_TICKS_REQUIRED', 3, 1, 30, True)
 MIN_CONFIRMATIONS = number('MIN_CONFIRMATIONS', 5, 4, 6, True)
 SIGNAL_DB = Path(os.getenv('SIGNAL_DB', str(DATA_DIR/'signals.sqlite3')))
+
+# Immediate cards by default. Optional UX sampling wait, not a data gate.
+SIGNAL_PREPARE_SECONDS = number('SIGNAL_PREPARE_SECONDS', 0, 0, 3)
